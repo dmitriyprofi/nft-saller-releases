@@ -29,8 +29,10 @@ jobs:
           esac
 
       - name: Reassemble and verify exact artifacts
-        shell: python
+        shell: bash
         run: |
+          set -euo pipefail
+          python3 - <<'PY'
           import base64, hashlib, json, os, re
           from pathlib import Path
 
@@ -117,6 +119,7 @@ jobs:
 
           print(f"Verified {installer_name}: {size} bytes")
           print(f"SHA-256 {pin['installerSha256']}")
+          PY
 
       - name: Publish mutable release channel
         shell: bash
