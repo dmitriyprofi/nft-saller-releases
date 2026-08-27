@@ -1,0 +1,147 @@
+name: Publish NFT saller release
+
+on:
+  push:
+    branches:
+      - publish-beta
+      - publish-stable
+    paths:
+      - 'publish/**'
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout staging branch
+        uses: actions/checkout@v4
+
+      - name: Resolve channel
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$GITHUB_REF_NAME" in
+            publish-beta) echo "CHANNEL=beta" >> "$GITHUB_ENV" ;;
+            publish-stable) echo "CHANNEL=stable" >> "$GITHUB_ENV" ;;
+            *) echo "Unexpected publish branch: $GITHUB_REF_NAME" >&2; exit 1 ;;
+          esac
+
+      - name: Reassemble and verify exact artifacts
+        shell: python
+        run: |
+          import base64, hashlib, json, os, re
+          from pathlib import Path
+
+          root = Path('publish')
+          pin_path = root / 'release-pin.json'
+          if not pin_path.is_file():
+              raise SystemExit('Missing publish/release-pin.json')
+          pin = json.loads(pin_path.read_text(encoding='utf-8'))
+
+          installer_name = pin['installer']
+          blockmap_name = pin['blockmap']
+          manifest_name = pin['manifest']
+          chunks = sorted((root / 'chunks').glob('*.part*'))
+          if not chunks:
+              raise SystemExit('No installer chunks found')
+          for part in chunks:
+              if part.stat().st_size > 48 * 1024 * 1024:
+                  raise SystemExit(f'Chunk exceeds safe git staging size: {part}')
+
+          installer = root / installer_name
+          with installer.open('wb') as out:
+              for part in chunks:
+                  with part.open('rb') as src:
+                      while True:
+                          data = src.read(1024 * 1024)
+                          if not data:
+                              break
+                          out.write(data)
+
+          size = installer.stat().st_size
+          if size != int(pin['installerSize']):
+              raise SystemExit(f'Installer size mismatch: {size}')
+
+          sha256 = hashlib.sha256()
+          sha512 = hashlib.sha512()
+          with installer.open('rb') as src:
+              while True:
+                  data = src.read(1024 * 1024)
+                  if not data:
+                      break
+                  sha256.update(data)
+                  sha512.update(data)
+          if sha256.hexdigest().upper() != pin['installerSha256'].upper():
+              raise SystemExit('Installer SHA-256 mismatch')
+          if sha512.hexdigest().upper() != pin['installerSha512Hex'].upper():
+              raise SystemExit('Installer SHA-512 mismatch')
+          sha512_b64 = base64.b64encode(sha512.digest()).decode('ascii')
+          if sha512_b64 != pin['installerSha512Base64']:
+              raise SystemExit('Installer SHA-512 base64 mismatch')
+
+          blockmap = root / blockmap_name
+          manifest = root / manifest_name
+          if not blockmap.is_file() or not manifest.is_file():
+              raise SystemExit('Blockmap or latest.yml missing')
+
+          text = manifest.read_text(encoding='utf-8').replace('\r', '')
+          def scalar(key):
+              m = re.search(rf'^\s*{re.escape(key)}:\s*(.+?)\s*$', text, re.M)
+              if not m:
+                  return None
+              value = m.group(1).strip()
+              if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                  value = value[1:-1]
+              return value
+
+          if scalar('version') != pin['version']:
+              raise SystemExit('latest.yml version mismatch')
+          manifest_path = scalar('path') or scalar('url')
+          if manifest_path != installer_name:
+              raise SystemExit('latest.yml installer path mismatch')
+          if scalar('sha512') != sha512_b64:
+              raise SystemExit('latest.yml SHA-512 mismatch')
+          manifest_size = scalar('size')
+          if manifest_size and int(manifest_size) != size:
+              raise SystemExit('latest.yml size mismatch')
+
+          notes = pin.get('notes') or f"NFT saller {pin['version']}"
+          (root / 'release-notes.txt').write_text(notes + '\n', encoding='utf-8')
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
+              env.write(f"VERSION={pin['version']}\n")
+              env.write(f"INSTALLER={installer_name}\n")
+              env.write(f"BLOCKMAP={blockmap_name}\n")
+              env.write(f"MANIFEST={manifest_name}\n")
+
+          print(f"Verified {installer_name}: {size} bytes")
+          print(f"SHA-256 {pin['installerSha256']}")
+
+      - name: Publish mutable release channel
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release delete "$CHANNEL" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag >/dev/null 2>&1 || true
+          args=(release create "$CHANNEL"
+            "publish/$INSTALLER"
+            "publish/$BLOCKMAP"
+            "publish/$MANIFEST"
+            --repo "$GITHUB_REPOSITORY"
+            --title "NFT saller $VERSION ($CHANNEL)"
+            --notes-file "publish/release-notes.txt")
+          if [[ "$CHANNEL" == "beta" ]]; then
+            args+=(--prerelease)
+          fi
+          gh "${args[@]}"
+          gh release view "$CHANNEL" --repo "$GITHUB_REPOSITORY" --json tagName,isPrerelease,assets,url
+
+      - name: Remove temporary publish branch
+        if: success()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$GITHUB_REF_NAME" >/dev/null 2>&1 || true
